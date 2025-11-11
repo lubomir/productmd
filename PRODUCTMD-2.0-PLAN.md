@@ -8,9 +8,20 @@ referenced via HTTPS URLs or OCI registry references. The metadata includes
 checksums for data integrity verification and supports bidirectional conversion
 between v2.0 (distributed) and v1.2 (local) formats.
 
+The implementation is divided into **two phases**:
+
+**Phase 1: Distributed Compose Metadata** - Core metadata format supporting
+distributed storage with Location objects, checksums, and localization.
+
+**Phase 2: Supplementary Pipeline Attachments** - OCI registry attachment
+mechanism enabling independent pipelines to add supplementary metadata
+(e.g., cloud images, container images) without modifying core compose metadata.
+
 ---
 
 ## Table of Contents
+
+**Phase 1: Distributed Composes**
 
 1. [Core Design Principles](#core-design-principles)
 2. [Metadata Schema Changes](#metadata-schema-changes)
@@ -25,6 +36,16 @@ between v2.0 (distributed) and v1.2 (local) formats.
 11. [Localization Strategy](#localization-strategy)
 12. [Implementation Plan](#implementation-plan)
 13. [Testing Strategy](#testing-strategy)
+
+**Phase 2: Supplementary Pipeline Attachments**
+
+14. [Supplementary Pipelines Overview](#supplementary-pipelines-overview)
+15. [OCI Attachment Mechanism](#oci-attachment-mechanism)
+16. [Pipeline Status Tracking](#pipeline-status-tracking)
+17. [Pipeline Manifest (Optional)](#pipeline-manifest-optional)
+18. [Client Behavior with Attachments](#client-behavior-with-attachments)
+19. [Validation Requirements](#validation-requirements)
+20. [Phase 2 Implementation Plan](#phase-2-implementation-plan)
 
 ---
 
@@ -1068,10 +1089,408 @@ $ productmd-downgrade \
 
 ---
 
+# PHASE 2: SUPPLEMENTARY PIPELINE ATTACHMENTS
+
+## 14. Supplementary Pipelines Overview
+
+### 14.1 Problem Statement
+
+Compose creation can involve multiple independent pipelines:
+
+1. **Core pipeline**: Creates essential artifacts (RPM repositories, installer, ISO images)
+   - Always required
+   - Produces the "main" metadata (composeinfo.json, rpms.json, images.json, etc.)
+   - Must complete successfully for a valid compose
+
+2. **Supplementary pipelines**: Create additional artifacts (cloud images,
+   container images, live media, etc.)
+   - Optional or required depending on product
+   - Run after core completes (may depend on core artifacts)
+   - Should not block core publication if they fail
+
+### 14.2 Design Goals
+
+- **Decoupled pipelines**: Core and supplementary pipelines don't directly coordinate
+- **Immutable core metadata**: Core metadata never changes after publication
+- **Failure isolation**: Supplementary pipeline failures don't invalidate core
+- **Progressive availability**: Core artifacts available immediately, supplementary added later
+- **Completion tracking**: Clients can determine when all expected pipelines have finished
+
+### 14.3 Architecture
+
+```
+Core Pipeline
+  ├── Produces: composeinfo.json, rpms.json, images.json, extra_files.json
+  ├── Pushes to: oci://registry.io/fedora/compose:39-20231201.0
+  └── Core manifest is IMMUTABLE after this point
+
+Supplementary Pipelines (run after core)
+  ├── Cloud Images Pipeline
+  │   ├── Attaches: cloud-images.json (application/vnd.productmd.images+json)
+  │   └── Attaches: pipeline status (application/vnd.productmd.pipeline-status+json)
+  │
+  └── Container Images Pipeline
+      ├── Attaches: container-images.json (application/vnd.productmd.images+json)
+      └── Attaches: pipeline status (application/vnd.productmd.pipeline-status+json)
+
+Client Library
+  └── Discovers and merges all attachments → Unified view
+```
+
+---
+
+## 15. OCI Attachment Mechanism
+
+### 15.1 OCI Referrers API
+
+Supplementary pipelines use the OCI referrers API (via `oras attach`) to attach
+metadata to the core manifest without modifying it.
+
+**Core manifest:**
+```
+oci://quay.io/fedora/compose:39-20231201.0@sha256:abc123...
+├── composeinfo.json
+├── rpms.json
+├── images.json
+└── extra_files.json
+```
+
+**Attachments (via OCI referrers):**
+```
+oci://quay.io/fedora/compose@sha256:abc123...
+├── [referrer 1] cloud-images.json (artifact type: application/vnd.productmd.images+json)
+├── [referrer 2] cloud-status-v1.json (artifact type: application/vnd.productmd.pipeline-status+json)
+├── [referrer 3] cloud-status-v2.json (artifact type: application/vnd.productmd.pipeline-status+json)
+└── [referrer 4] container-images.json (artifact type: application/vnd.productmd.images+json)
+```
+
+### 15.2 Artifact Type Conventions
+
+| Artifact Type | Description | Producer |
+|---------------|-------------|----------|
+| `application/vnd.productmd.compose+json` | Core compose bundle | Core pipeline |
+| `application/vnd.productmd.images+json` | Images metadata (core or supplementary) | Any pipeline producing images |
+| `application/vnd.productmd.pipeline-status+json` | Pipeline execution status | Each pipeline (multiple revisions) |
+| `application/vnd.productmd.pipeline-manifest+json` | Expected pipelines declaration (optional) | Orchestrator or setup |
+
+### 15.3 Attachment Schema
+
+Supplementary metadata files use the **same schema as core metadata files**.
+
+**Example: cloud-images.json**
+```json
+{
+  "header": {
+    "version": "2.0",
+    "type": "productmd.images"
+  },
+  "payload": {
+    "compose": {
+      "id": "Fedora-39-20231201.0",
+      "type": "production",
+      "date": "20231201",
+      "respin": 0
+    },
+    "images": {
+      "Server": {
+        "x86_64": [
+          {
+            "location": {
+              "url": "oci://quay.io/fedora/cloud:server-39-x86_64@sha256:...",
+              "size": 536870912,
+              "checksum": "sha256:...",
+              "local_path": "Server/x86_64/images/Fedora-Server-39-x86_64.qcow2"
+            },
+            "type": "qcow2",
+            "format": "qcow2",
+            "arch": "x86_64",
+            "subvariant": "Server"
+          }
+        ]
+      }
+    }
+  }
+}
+```
+
+### 15.4 Publishing Workflow
+
+**Core pipeline:**
+```bash
+# Build core artifacts and metadata
+productmd-upgrade --input /compose --output /tmp/v2 --compute-checksums
+
+# Push to registry as OCI artifact
+oras push quay.io/fedora/compose:39-20231201.0 \
+  --artifact-type application/vnd.productmd.compose+json \
+  composeinfo.json \
+  rpms.json \
+  images.json \
+  extra_files.json
+```
+
+**Supplementary pipeline:**
+```bash
+# Get core manifest digest
+CORE_DIGEST=$(oras manifest fetch quay.io/fedora/compose:39-20231201.0 | \
+              jq -r '.config.digest')
+
+# Attach supplementary metadata
+oras attach quay.io/fedora/compose@${CORE_DIGEST} \
+  --artifact-type application/vnd.productmd.images+json \
+  cloud-images.json
+```
+
+---
+
+## 16. Pipeline Status Tracking
+
+### 16.1 Purpose
+
+Each pipeline publishes status updates to communicate:
+- When it started
+- Whether it's in progress, complete, or failed
+- Maximum expected duration (for timeout detection)
+- Logs and debugging information
+
+This enables clients to:
+- Detect when all expected pipelines have finished
+- Distinguish "still running" from "failed"
+- Handle catastrophic failures (where pipeline can't update status)
+
+### 16.2 Status Schema
+
+**Required fields:**
+```json
+{
+  "pipeline_id": "string (unique identifier for this pipeline instance)",
+  "status": "in_progress | complete | failed",
+  "revision": 1,
+  "started_at": "ISO 8601 timestamp",
+  "max_duration_hours": 4,
+  "compose_id": "Fedora-39-20231201.0"
+}
+```
+
+**Optional/recommended fields:**
+```json
+{
+  "pipeline_name": "cloud-images (human-readable name)",
+  "completed_at": "ISO 8601 timestamp (for complete/failed)",
+  "failed_at": "ISO 8601 timestamp (for failed)",
+  "error": "Error message (for failed)",
+  "logs_url": "https://ci.example.com/job/12345",
+  "builder_version": "2.3.1"
+}
+```
+
+Pipelines may add any additional fields useful for debugging or monitoring.
+
+### 16.3 Status Lifecycle
+
+**1. Pipeline starts:**
+```bash
+# Attach initial status
+cat > status-v1.json <<EOF
+{
+  "pipeline_id": "cloud-images-20231201-001",
+  "pipeline_name": "cloud-images",
+  "status": "in_progress",
+  "revision": 1,
+  "started_at": "2023-12-01T10:00:00Z",
+  "max_duration_hours": 4,
+  "compose_id": "Fedora-39-20231201.0"
+}
+EOF
+
+oras attach quay.io/fedora/compose@${CORE_DIGEST} \
+  --artifact-type application/vnd.productmd.pipeline-status+json \
+  status-v1.json
+```
+
+**2. Pipeline completes successfully:**
+```bash
+cat > status-v2.json <<EOF
+{
+  "pipeline_id": "cloud-images-20231201-001",
+  "pipeline_name": "cloud-images",
+  "status": "complete",
+  "revision": 2,
+  "started_at": "2023-12-01T10:00:00Z",
+  "completed_at": "2023-12-01T12:30:00Z",
+  "compose_id": "Fedora-39-20231201.0",
+  "logs_url": "https://ci.example.com/job/12345"
+}
+EOF
+
+oras attach quay.io/fedora/compose@${CORE_DIGEST} \
+  --artifact-type application/vnd.productmd.pipeline-status+json \
+  status-v2.json
+```
+
+**3. Pipeline fails:**
+```bash
+cat > status-v2.json <<EOF
+{
+  "pipeline_id": "cloud-images-20231201-001",
+  "pipeline_name": "cloud-images",
+  "status": "failed",
+  "revision": 2,
+  "started_at": "2023-12-01T10:00:00Z",
+  "failed_at": "2023-12-01T11:15:00Z",
+  "compose_id": "Fedora-39-20231201.0",
+  "error": "Image build failed: insufficient disk space on build worker",
+  "logs_url": "https://ci.example.com/job/12345"
+}
+EOF
+
+oras attach quay.io/fedora/compose@${CORE_DIGEST} \
+  --artifact-type application/vnd.productmd.pipeline-status+json \
+  status-v2.json
+```
+
+**4. Catastrophic failure (pipeline crashes):**
+```
+Pipeline started at 10:00, max_duration_hours = 4
+Current time: 15:00 (5 hours later)
+
+Client logic:
+  if started_at + max_duration_hours < now():
+      status = "timeout_failure"
+```
+
+### 16.4 Pipeline ID Coordination
+
+Pipeline IDs must be unique within a compose. Coordination strategies:
+
+- **Convention-based**: `"cloud-images"`, `"container-images"` (teams coordinate)
+- **UUID**: `"550e8400-e29b-41d4-a716-446655440000"` (guaranteed unique)
+- **Composite**: `"cloud-images-20231201-001"` (name + date + sequence)
+
+Choice is left to the implementation team.
+
+---
+
+## 17. Pipeline Manifest (Optional)
+
+### 17.1 Purpose
+
+An optional manifest declares which supplementary pipelines are expected for a
+compose. This enables:
+
+- Clients to know when to stop waiting for more attachments
+- Clear completion criteria (all expected pipelines finished)
+- Progress tracking during compose creation
+
+**Note:** If an artifact is truly required for a valid compose, it belongs in
+the core pipeline. Supplementary pipelines by definition are things that can
+fail without invalidating the core compose.
+
+### 17.2 Schema
+
+```json
+{
+  "compose_id": "Fedora-39-20231201.0",
+  "expected_pipelines": [
+    "cloud-images",
+    "container-images",
+    "vagrant-images"
+  ],
+  "created_at": "2023-12-01T09:55:00Z"
+}
+```
+
+### 17.3 Who Publishes the Manifest?
+
+The manifest is **optional** and can be published by:
+
+- **CI/CD orchestrator** (knows what pipelines it will trigger)
+- **Setup/planning phase** (before core pipeline runs)
+- **Core pipeline** (if it knows about supplementary pipelines)
+- **Nobody** (composes work without a manifest using best-effort mode)
+
+### 17.4 Publishing the Manifest
+
+```bash
+oras attach quay.io/fedora/compose@${CORE_DIGEST} \
+  --artifact-type application/vnd.productmd.pipeline-manifest+json \
+  pipeline-manifest.json
+```
+
+---
+
+## 18. Client Behavior with Attachments
+
+### 18.1 Unified Abstraction
+
+The ProductMD library presents a **unified view** of core + all attachments.
+Consumers don't need to know about the attachment mechanism.
+
+**API (unchanged from Phase 1):**
+```python
+# Works with both filesystem and OCI references
+compose = productmd.Compose("oci://quay.io/fedora/compose:39-20231201.0")
+
+# Returns ALL images: core + cloud + container + any other attachments
+# Library internally discovers and merges everything
+all_images = compose.images
+```
+
+### 18.2 Localization with Attachments
+
+The `productmd-localize` tool treats core + attachments as a unified dataset:
+
+```bash
+productmd-localize \
+  --input oci://quay.io/fedora/compose:39-20231201.0 \
+  --output /mnt/local-compose \
+  --skip-type iso  # Optional filtering by image type
+```
+
+**Process:**
+1. Load core metadata from OCI
+2. Discover and merge all attachments
+3. Download all artifacts from unified view
+4. Write v1.2 local compose
+
+**Result:** Local compose contains everything from core and attachments,
+indistinguishable in the filesystem layout.
+
+---
+
+## 19. Validation Requirements
+
+### 19.1 Attachment Validation
+
+When merging attachments with core metadata, the library performs **strict validation**:
+
+**Required checks (raises exception on failure):**
+
+1. Compose ID match
+2. Metadata version compatibility
+3. Variant existence
+4. Architecture compatibility
+
+### 19.2 Existing Validation
+
+After merging, the library applies all existing ProductMD validation rules:
+- All images have sufficient metadata for unique identification
+- Schema validation
+- Checksum format validation
+- Location URL validation
+
+---
+
 ## Appendix C: Glossary
+
+**Attachment**: An OCI artifact referenced via the referrers API that extends
+core compose metadata without modifying it (Phase 2).
 
 **Compose**: A complete snapshot of a Linux distribution ready for release,
 including metadata, RPMs, images, and repositories.
+
+**Core pipeline**: The primary build pipeline that creates essential artifacts
+and publishes the immutable core metadata (Phase 2).
 
 **Location**: An object representing the location and integrity information for
 a single artifact (file or repository).
@@ -1085,8 +1504,17 @@ placed in the v1.2 filesystem layout.
 **OCI**: Open Container Initiative - a standard for container images and
 registries.
 
+**Pipeline manifest**: Optional metadata declaring expected supplementary
+pipelines for completion tracking (Phase 2).
+
+**Pipeline status**: Metadata attached by each pipeline to track execution
+state, start time, and completion (Phase 2).
+
 **Repomd.xml**: The primary metadata file for a YUM/DNF repository, containing
 checksums of all other repository metadata.
+
+**Supplementary pipeline**: An independent build pipeline that attaches
+additional metadata (e.g., cloud images) after core completion (Phase 2).
 
 **TreeInfo**: An INI-format metadata file (.treeinfo) used by installers and
 boot loaders, typically found on installation media.
